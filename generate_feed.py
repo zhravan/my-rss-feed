@@ -1,11 +1,10 @@
-import html
 import json
 import os
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from email.utils import format_datetime
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -16,7 +15,7 @@ USER_AGENT = "Mozilla/5.0 (compatible; MyRSSFeed/1.0; +https://github.com/zhrava
 
 
 def clean_text(value):
-    return re.sub(r"\\s+", " ", value or "").strip()
+    return re.sub(r"\s+", " ", value or "").strip()
 
 
 def load_existing():
@@ -38,50 +37,69 @@ def load_existing():
         return []
 
 
-def fetch_profile(url):
+def fetch_page(url):
     response = requests.get(
         url,
-        headers={"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"},
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml",
+        },
         timeout=30,
     )
     response.raise_for_status()
     return response.text
 
 
-def parse_posts(profile_url, markup):
+def parse_linkedin_posts(markup, source_label):
     soup = BeautifulSoup(markup, "html.parser")
-    profile_name = clean_text(soup.find("h1").get_text(" ", strip=True)) if soup.find("h1") else profile_url.rstrip("/").split("/")[-1]
     posts = []
 
-    # LinkedIn's public activity pages can expose post/article links in anchors.
     for anchor in soup.find_all("a", href=True):
-        href = urljoin(profile_url, anchor["href"])
-        if "linkedin.com/posts/" not in href and "linkedin.com/feed/update/" not in href:
+        href = urljoin("https://www.linkedin.com", anchor["href"])
+        clean_href = href.split("?")[0]
+        if "linkedin.com/posts/" not in clean_href and "linkedin.com/feed/update/" not in clean_href:
             continue
+
         text = clean_text(anchor.get_text(" ", strip=True))
         if not text:
+            # Some public search pages expose the post text in a nearby parent.
+            parent = anchor.find_parent()
+            text = clean_text(parent.get_text(" ", strip=True)) if parent else ""
+        if not text:
             continue
+
         posts.append({
-            "title": f"{profile_name}: {text[:140]}",
-            "link": href.split("?")[0],
-            "description": text,
+            "title": f"{source_label}: {text[:140]}",
+            "link": clean_href,
+            "description": text[:4000],
             "pubDate": format_datetime(datetime.now(timezone.utc)),
-            "guid": href.split("?")[0],
+            "guid": clean_href,
         })
 
-    # Remove duplicate links while preserving order.
     unique = {}
     for post in posts:
-        unique.setdefault(post["link"], post)
+        unique.setdefault(post["guid"], post)
     return list(unique.values())
+
+
+def fetch_profile(profile_url):
+    return parse_linkedin_posts(fetch_page(profile_url), profile_url.rstrip("/").split("/")[-1])
+
+
+def fetch_keyword(keyword):
+    # Public LinkedIn content-search URL. If LinkedIn requires authentication or
+    # returns a challenge page, the request is skipped rather than bypassing it.
+    search_url = "https://www.linkedin.com/search/results/content/?keywords=" + quote(keyword)
+    return parse_linkedin_posts(fetch_page(search_url), f'LinkedIn · {keyword}')
 
 
 def write_feed(items):
     rss = ET.Element("rss", {"version": "2.0"})
     channel = ET.SubElement(rss, "channel")
-    ET.SubElement(channel, "title").text = "My RSS Feed"
+    ET.SubElement(channel, "title").text = "My LinkedIn RSS Feed"
     ET.SubElement(channel, "link").text = "https://zhravan.github.io/my-rss-feed/"
-    ET.SubElement(channel, "description").text = "Personal RSS feed"
+    ET.SubElement(channel, "description").text = "LinkedIn posts from followed people and keywords"
     ET.SubElement(channel, "lastBuildDate").text = format_datetime(datetime.now(timezone.utc))
 
     for item in items:
@@ -102,15 +120,22 @@ def main():
     existing = load_existing()
     by_guid = {item["guid"]: item for item in existing}
 
-    for profile in config.get("linkedin_profiles", []):
+    for profile in config.get("linkedin_profiles", [])[: config.get("max_items_per_profile", 20)]:
         try:
-            markup = fetch_profile(profile)
-            for post in parse_posts(profile, markup):
+            for post in fetch_profile(profile):
                 by_guid.setdefault(post["guid"], post)
         except requests.RequestException as exc:
-            print(f"Could not fetch {profile}: {exc}")
+            print(f"Could not fetch LinkedIn profile {profile}: {exc}")
 
-    items = list(by_guid.values())[: config.get("max_total_items", 100)]
+    for keyword in config.get("linkedin_keywords", []):
+        try:
+            posts = fetch_keyword(keyword)
+            for post in posts[: config.get("max_items_per_keyword", 20)]:
+                by_guid.setdefault(post["guid"], post)
+        except requests.RequestException as exc:
+            print(f"Could not fetch LinkedIn keyword '{keyword}': {exc}")
+
+    items = list(by_guid.values())[: config.get("max_total_items", 200)]
     write_feed(items)
 
 
