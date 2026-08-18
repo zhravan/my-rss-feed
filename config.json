@@ -1,5 +1,7 @@
 {
   "linkedin_profiles": [],
+  "linkedin_keywords": [],
   "max_items_per_profile": 20,
-  "max_total_items": 100
+  "max_items_per_keyword": 20,
+  "max_total_items": 200
 }
